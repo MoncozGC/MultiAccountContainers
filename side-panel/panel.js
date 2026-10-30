@@ -28,7 +28,6 @@ var containers = [];
 var alwaysOpen = {};
 var selColor = COLORS[0].hex;
 var selIcon = ICONS_LIST[0];
-var selShowTabColor = false;
 var isEdit = false;
 
 function msg(d) {
@@ -102,10 +101,6 @@ function renderList() {
     h += '<div class="c-dot" style="background:' + c.color + '"></div>';
     h += '<div class="c-emoji">' + em(c.icon) + '</div>';
     h += '<div class="c-info"><div class="c-name">' + esc(c.name) + '</div>';
-    // نمایش وضعیت Color tab bar
-    if (c.showTabColor) {
-      h += '<div class="c-tabcolor"><span class="c-tabcolor-dot" style="background:' + c.color + '"></span>Tab color ON</div>';
-    }
     h += '</div>';
     h += '<div class="c-actions">';
     h += '<button class="editbtn" data-id="' + c.id + '">\u270F</button>';
@@ -215,8 +210,7 @@ function openCreate() {
   document.getElementById('modal-title').textContent = 'New Container';
   document.getElementById('m-id').value = '';
   document.getElementById('m-name').value = '';
-  selColor = COLORS[0].hex; selIcon = ICONS_LIST[0]; selShowTabColor = false;
-  document.getElementById('m-show-tab-color').checked = false;
+  selColor = COLORS[0].hex; selIcon = ICONS_LIST[0];
   buildCP(); buildIP();
   document.getElementById('m-delete').style.display = 'none';
   document.getElementById('m-ok').textContent = 'Create';
@@ -231,8 +225,7 @@ function openEdit(id) {
   document.getElementById('modal-title').textContent = 'Edit Container';
   document.getElementById('m-id').value = id;
   document.getElementById('m-name').value = c.name;
-  selColor = c.color; selIcon = c.icon; selShowTabColor = !!c.showTabColor;
-  document.getElementById('m-show-tab-color').checked = selShowTabColor;
+  selColor = c.color; selIcon = c.icon;
   buildCP(); buildIP();
   document.getElementById('m-delete').style.display = 'inline-block';
   document.getElementById('m-ok').textContent = 'Save';
@@ -246,11 +239,10 @@ async function doSave() {
   var id = document.getElementById('m-id').value;
   var name = document.getElementById('m-name').value.trim();
   if (!name) { toast('Enter a name'); return; }
-  var showTabColor = document.getElementById('m-show-tab-color').checked;
   if (isEdit) {
-    await msg({ action: 'updateContainer', containerId: id, updates: { name: name, color: selColor, icon: selIcon, showTabColor: showTabColor } });
+    await msg({ action: 'updateContainer', containerId: id, updates: { name: name, color: selColor, icon: selIcon } });
   } else {
-    await msg({ action: 'createContainer', data: { name: name, color: selColor, icon: selIcon, showTabColor: showTabColor } });
+    await msg({ action: 'createContainer', data: { name: name, color: selColor, icon: selIcon } });
   }
   containers = (await msg({ action: 'getContainers' })) || [];
   renderList(); renderRules(); renderSelects(); loadTabInfo(); closeModal();

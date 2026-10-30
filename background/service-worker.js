@@ -112,17 +112,16 @@ async function _saveGroupMap() {
   } catch (e) {}
 }
 
-// v4.3+: بررسی آیا container باید نوار رنگی داشته باشد
-async function shouldShowTabColor(container) {
-  if (!container) return false;
-  return !!container.showTabColor;
+// Serialize group creation so simultaneous tabs share one group per window/container.
+let _groupQueue = Promise.resolve();
+function addToContainerGroup(tabId, container) {
+  const pending = _groupQueue.then(() => _addToContainerGroup(tabId, container));
+  _groupQueue = pending.catch(() => {});
+  return pending;
 }
 
-// اضافه کردن تب به گروه container (فقط اگر showTabColor فعال باشد)
-async function addToContainerGroup(tabId, container) {
-  if (!chrome.tabGroups) return;
-  // فقط اگر کاربر تیک زده باشد
-  if (!await shouldShowTabColor(container)) return;
+async function _addToContainerGroup(tabId, container) {
+  if (!chrome.tabGroups || !container) return;
 
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -132,12 +131,14 @@ async function addToContainerGroup(tabId, container) {
     const groupColor = _toGroupColor(container.color);
 
     // بررسی آیا گروه قبلاً وجود دارد
-    if (_groupMap[key]) {
+    if (_groupMap[key] !== undefined) {
       try {
         const groupId = _groupMap[key];
-        await chrome.tabGroups.get(groupId);
+        const group = await chrome.tabGroups.get(groupId);
+        if (group.windowId !== tab.windowId) throw new Error('Group moved to another window');
         // گروه وجود دارد — اضافه کردن تب
         await chrome.tabs.group({ tabIds: [tabId], groupId });
+        await chrome.tabGroups.update(groupId, { title: container.name, color: groupColor });
         console.log('[TabGroup] Added tab', tabId, 'to existing group', groupId);
         return;
       } catch (e) {
@@ -149,7 +150,7 @@ async function addToContainerGroup(tabId, container) {
     // ساختن گروه جدید
     const groupId = await chrome.tabs.group({ tabIds: [tabId] });
     await chrome.tabGroups.update(groupId, {
-      title: '',
+      title: container.name,
       color: groupColor,
       collapsed: false
     });
@@ -190,23 +191,7 @@ async function recoverTabGroups() {
       const tabId = parseInt(tidStr);
       const container = await containerMgr.get(cid);
       if (!container) continue;
-      if (!await shouldShowTabColor(container)) continue;
-
       try {
-        const tab = await chrome.tabs.get(tabId);
-        if (!tab || !tab.url || tab.url.startsWith('chrome://') || tab.url === 'about:blank') continue;
-
-        const key = tab.windowId + ':' + cid;
-
-        if (_groupMap[key]) {
-          try {
-            const g = await chrome.tabGroups.get(_groupMap[key]);
-            continue;
-          } catch (e) {
-            delete _groupMap[key];
-          }
-        }
-
         await addToContainerGroup(tabId, container);
       } catch (e) {}
     }
@@ -238,14 +223,36 @@ async function ungroupAllContainerTabs(containerId) {
 // ============================================================
 // INIT
 // ============================================================
+// Restore persisted mappings on every worker load, including an idle wake-up.
+const initialization = (async () => {
+  await containerMgr.init();
+  await tabMgr.init();
+})();
+const isolationRecovery = initialization.then(async () => {
+  for (const [tid, cid] of Object.entries(tabMgr.getMap())) {
+    const tabId = Number(tid);
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); } catch { await tabMgr.remove(tabId); continue; }
+    if (!tab.url || (!tab.url.startsWith('http') && tab.url !== 'about:blank')) continue;
+    try { await debuggerMgr.attach(tabId, cid); }
+    catch (e) { lastError = e.message; console.error('[Isolation recovery]', e); }
+  }
+});
+isolationRecovery.catch(e => { lastError = e.message; console.error('[Isolation recovery]', e); });
+const groupRecovery = initialization.then(async () => {
+  await _loadGroupMap();
+  await recoverTabGroups();
+});
+groupRecovery.catch(e => {
+  lastError = 'Group recovery failed: ' + e.message;
+  console.error('[TabGroup] Recovery failed:', e);
+});
+
 chrome.runtime.onInstalled.addListener(async (details) => {
   console.log('[Containers v4.4] Installed:', details.reason);
   try {
-    await containerMgr.init();
-    await tabMgr.init();
-    await _loadGroupMap();
+    await initialization;
     await rebuildContextMenu();
-    await recoverTabGroups();
     console.log('[Containers v4.4] Init OK — All bugs fixed!');
   } catch (e) {
     lastError = 'Init failed: ' + e.message;
@@ -255,11 +262,8 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 chrome.runtime.onStartup.addListener(async () => {
   try {
-    await containerMgr.init();
-    await tabMgr.init();
-    await _loadGroupMap();
+    await initialization;
     await rebuildContextMenu();
-    await recoverTabGroups();
     console.log('[Containers v4.4] Startup OK');
   } catch (e) {
     lastError = 'Startup failed: ' + e.message;
@@ -372,7 +376,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleMessage(message, sender) {
+  await initialization;
   switch (message.action) {
+    case 'prepareChildTab':
+      return await prepareChildTab(message, sender);
     case 'ping':
       return { pong: true, version: '4.4.0', containersCount: Object.keys(await containerMgr.getAll()).length };
 
@@ -386,45 +393,39 @@ async function handleMessage(message, sender) {
     case 'getContainers':
       return await containerMgr.getSorted();
 
-    case 'createContainer':
-      return await containerMgr.create(message.data);
+    case 'createContainer': {
+      const created = await containerMgr.create(message.data);
+      await rebuildContextMenu();
+      return created;
+    }
 
     case 'updateContainer': {
       const updated = await containerMgr.update(message.containerId, message.updates);
-
-      // اگر showTabColor خاموش شد، تب‌ها را از گروه خارج کن
-      if (message.updates.showTabColor === false) {
-        await ungroupAllContainerTabs(message.containerId);
-      }
-
-      // اگر showTabColor روشن شد، تب‌های فعال را به گروه اضافه کن
-      if (message.updates.showTabColor === true) {
-        const tabMap = tabMgr.getMap();
-        for (const [tidStr, cid] of Object.entries(tabMap)) {
-          if (cid === message.containerId) {
-            const tabId = parseInt(tidStr);
-            try {
-              const tab = await chrome.tabs.get(tabId);
-              if (tab && tab.url && !tab.url.startsWith('chrome://') && tab.url !== 'about:blank') {
-                await addToContainerGroup(tabId, updated);
-              }
-            } catch (e) {}
-          }
-        }
-      }
 
       // بروزرسانی رنگ/نام گروه اگر تغییر کرد
       if (message.updates.color || message.updates.name) {
         await updateContainerGroupAppearance(message.containerId, updated);
       }
+      await rebuildContextMenu();
       return updated;
     }
 
-    case 'deleteContainer':
+    case 'deleteContainer': {
       await ungroupAllContainerTabs(message.containerId);
+      for (const [tid, cid] of Object.entries(tabMgr.getMap())) {
+        if (cid !== message.containerId) continue;
+        const tabId = Number(tid);
+        await debuggerMgr.detach(tabId);
+        await tabMgr.remove(tabId);
+        updateBadge(tabId, null);
+      }
       await containerMgr.delete(message.containerId);
+      const stored = await chrome.storage.local.get(STORAGE_KEYS.ALWAYS_OPEN);
+      const rules = Object.fromEntries(Object.entries(stored[STORAGE_KEYS.ALWAYS_OPEN] || {}).filter(([, cid]) => cid !== message.containerId));
+      await chrome.storage.local.set({ [STORAGE_KEYS.ALWAYS_OPEN]: rules });
       await rebuildContextMenu();
       return { success: true };
+    }
 
     case 'openInContainer':
       return await openInContainer(message.url, message.containerId, message.active !== false);
@@ -468,15 +469,16 @@ async function handleMessage(message, sender) {
       return { success: true };
     }
 
-    case 'getCookieString':
-      return await cookieMgr.getCookieString(message.containerId, message.url);
+    case 'getCookieString': {
+      const cid = sender.tab ? tabMgr.getContainer(sender.tab.id) : message.containerId;
+      return { cookieString: cid ? await cookieMgr.getCookieString(cid, sender.url || message.url, false) : '' };
+    }
 
     case 'captureCookies': {
-      if (message.containerId && message.url) {
-        await cookieMgr.captureSetCookie(message.containerId, message.url, message.rawCookie);
-        if (message.tabId) {
-          debuggerMgr.updateCookieCache(message.tabId, message.containerId);
-        }
+      const cid = sender.tab ? tabMgr.getContainer(sender.tab.id) : message.containerId;
+      if (cid && (sender.url || message.url)) {
+        await cookieMgr.captureSetCookie(cid, sender.url || message.url, message.rawCookie);
+        await debuggerMgr.refreshContainer(cid);
       }
       return { success: true };
     }
@@ -509,14 +511,13 @@ async function handleMessage(message, sender) {
 // ============================================================
 async function updateContainerGroupAppearance(containerId, container) {
   if (!chrome.tabGroups) return;
-  if (!await shouldShowTabColor(container)) return;
   try {
     const groupColor = _toGroupColor(container.color);
     for (const [key, gid] of Object.entries(_groupMap)) {
       if (key.endsWith(':' + containerId)) {
         try {
           await chrome.tabGroups.update(gid, {
-            title: '',
+            title: container.name,
             color: groupColor
           });
         } catch (e) {}
@@ -529,12 +530,15 @@ async function updateContainerGroupAppearance(containerId, container) {
 // CORE: Open URL in Container
 // ============================================================
 async function openInContainer(url, containerId, active = true) {
+  await initialization;
   const container = await containerMgr.get(containerId);
   if (!container) throw new Error('Container not found: ' + containerId);
   console.log('[v4.4] Opening', url, 'in', container.name);
 
   // Create the tab
-  const tab = await chrome.tabs.create({ url, active });
+  const target = new URL(url);
+  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Only HTTP(S) URLs can open in a container');
+  const tab = await chrome.tabs.create({ url: 'about:blank', active });
 
   // Assign tab to container
   await tabMgr.assign(tab.id, containerId);
@@ -542,23 +546,55 @@ async function openInContainer(url, containerId, active = true) {
   // Badge فقط وقتی showTabColor خاموش است
   updateBadge(tab.id, container);
 
-  // Set the container marker cookie
-  await setMarkerCookie(tab.id, url, containerId);
-
-  // Add to colored tab group (فقط اگر showTabColor فعال باشد)
-  await addToContainerGroup(tab.id, container);
-
-  // Attach debugger for Cookie header injection
+  // Install isolation before the first website request. Grouping is presentation only.
   await debuggerMgr.attach(tab.id, containerId);
+  await chrome.tabs.update(tab.id, { url: target.href });
+  addToContainerGroup(tab.id, container).catch(e => console.warn('[TabGroup]', e.message));
 
   lastActiveContainer = containerId;
   return { tabId: tab.id, containerId, containerName: container.name };
+}
+
+// Page-created windows remain blank until their opener's isolation is ready.
+async function prepareChildTab(message, sender) {
+  const containerId = sender.tab && tabMgr.getContainer(sender.tab.id);
+  if (!containerId) throw new Error('The opener has no container');
+  if (!/^about:blank#mc-child-[a-f0-9]{32}$/.test(message.marker || '')) throw new Error('Invalid child marker');
+  const url = new URL(message.url);
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported child URL');
+  let child;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const tabs = await chrome.tabs.query({});
+    child = tabs.find(tab => (tab.pendingUrl || tab.url) === message.marker);
+    if (child) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  if (!child) throw new Error('The child window was blocked or closed');
+  const previous = tabMgr.getContainer(child.id);
+  if (previous && previous !== containerId) throw new Error('Cannot reuse a different container window');
+  // Chrome's debugger permission check accepts plain about:blank, but rejects
+  // an opener-created about:blank URL with a fragment on some Chrome versions.
+  await chrome.tabs.update(child.id, { url: 'about:blank' });
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const tab = await chrome.tabs.get(child.id);
+    if (tab.url === 'about:blank' && tab.status === 'complete') break;
+    if (attempt === 39) throw new Error('Child blank page did not finish loading');
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  await tabMgr.assign(child.id, containerId);
+  await debuggerMgr.attach(child.id, containerId);
+  const container = await containerMgr.get(containerId);
+  updateBadge(child.id, container);
+  await chrome.tabs.update(child.id, { url: url.href });
+  addToContainerGroup(child.id, container).catch(e => console.warn('[TabGroup]', e.message));
+  return { tabId: child.id, containerId };
 }
 
 // ============================================================
 // CORE: Open new tab in Container
 // ============================================================
 async function openNewTabInContainer(containerId, url) {
+  await initialization;
   if (url && url.startsWith('http')) {
     return await openInContainer(url, containerId, true);
   }
@@ -567,7 +603,8 @@ async function openNewTabInContainer(containerId, url) {
   const newTab = await chrome.tabs.create({ url: 'about:blank', active: true });
   await tabMgr.assign(newTab.id, containerId);
   updateBadge(newTab.id, container);
-  await addToContainerGroup(newTab.id, container);
+  await debuggerMgr.attach(newTab.id, containerId);
+  addToContainerGroup(newTab.id, container).catch(e => console.warn('[TabGroup]', e.message));
   lastActiveContainer = containerId;
   return { tabId: newTab.id, containerId, containerName: container.name };
 }
@@ -590,6 +627,7 @@ async function reopenTabInContainer(tabId, containerId) {
 // ============================================================
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   try {
+    await initialization;
     const tab = await chrome.tabs.get(tabId);
     if (!tab || !tab.url || tab.url.startsWith('chrome://') || tab.url === 'about:blank') return;
 
@@ -604,7 +642,6 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
     // Make sure debugger is attached
     if (!debuggerMgr.isAttached(tabId)) {
       console.log('[v4.4] Re-attaching debugger to tab', tabId);
-      await setMarkerCookie(tabId, tab.url, cid);
       await debuggerMgr.attach(tabId, cid);
     }
   } catch (e) {
@@ -614,6 +651,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 
 // When tab URL changes
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  await initialization;
   if (!changeInfo.url) return;
 
   if (_reloadingTabs.has(tabId)) {
@@ -629,71 +667,84 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
 
   if (changeInfo.url.startsWith('http')) {
     if (!debuggerMgr.isAttached(tabId)) {
-      await setMarkerCookie(tabId, changeInfo.url, cid);
       await debuggerMgr.attach(tabId, cid);
-    } else {
-      debuggerMgr.updateCookieCache(tabId, cid);
-      debuggerMgr.setTabUrl(tabId, changeInfo.url);
     }
   }
 });
 
 // When tab is closed
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await initialization;
   const cid = tabMgr.getContainer(tabId);
   await debuggerMgr.detach(tabId);
   await tabMgr.remove(tabId);
 });
 
+// Keep the same per-window grouping when a container tab moves to another window.
+chrome.tabs.onAttached.addListener(async (tabId) => {
+  await groupRecovery;
+  const container = await containerMgr.get(tabMgr.getContainer(tabId));
+  if (container) await addToContainerGroup(tabId, container);
+});
+
 // When tab group is auto-removed
 if (chrome.tabGroups) {
   try {
-    chrome.tabGroups.onRemoved.addListener((groupId) => {
-      onTabGroupRemoved(groupId);
+    chrome.tabGroups.onRemoved.addListener((group) => {
+      onTabGroupRemoved(group.id);
     });
   } catch (e) {}
 }
 
 // ============================================================
-// HELPER: Set marker cookie
+// BADGE — فقط وقتی showTabColor خاموش باشد
 // ============================================================
-async function setMarkerCookie(tabId, url, containerId) {
-  if (!url || !url.startsWith('http')) return;
+const toolbarIconRequests = new Map();
+let toolbarBaseIcon;
+async function updateToolbarIcon(tabId, color) {
+  if (!chrome.action.setIcon) return;
+  const request = {};
+  toolbarIconRequests.set(tabId, request);
   try {
-    const urlObj = new URL(url);
-    const cookieDomain = urlObj.hostname.startsWith('www.') ? urlObj.hostname.replace('www.', '') : urlObj.hostname;
-    await chrome.cookies.set({
-      url: url,
-      name: '__mc_container__',
-      value: containerId,
-      domain: cookieDomain,
-      path: '/',
-      secure: url.startsWith('https'),
-      sameSite: 'no_restriction'
-    });
-  } catch (e) {
-    console.warn('[v4.4] Failed to set marker cookie:', e.message);
+    if (!color) {
+      await chrome.action.setIcon({ tabId, path: { 16: 'icons/icon16.png', 48: 'icons/icon48.png', 128: 'icons/icon128.png' } });
+      return;
+    }
+    if (!toolbarBaseIcon) {
+      toolbarBaseIcon = fetch(chrome.runtime.getURL('icons/icon128.png'))
+        .then(response => response.blob()).then(blob => createImageBitmap(blob));
+    }
+    const base = await toolbarBaseIcon;
+    const imageData = {};
+    for (const size of [16, 32]) {
+      const canvas = new OffscreenCanvas(size, size);
+      const context = canvas.getContext('2d');
+      context.drawImage(base, 0, 0, size, size);
+      context.beginPath();
+      context.arc(size * 0.79, size * 0.79, size * 0.16, 0, Math.PI * 2);
+      context.fillStyle = color;
+      context.fill();
+      context.strokeStyle = '#fff';
+      context.lineWidth = size / 16;
+      context.stroke();
+      imageData[size] = context.getImageData(0, 0, size, size);
+    }
+    if (toolbarIconRequests.get(tabId) === request) await chrome.action.setIcon({ tabId, imageData });
+  } catch (error) {
+    console.warn('[Toolbar icon]', error.message);
+  } finally {
+    if (toolbarIconRequests.get(tabId) === request) toolbarIconRequests.delete(tabId);
   }
 }
 
-// ============================================================
-// BADGE — فقط وقتی showTabColor خاموش باشد
-// ============================================================
 function updateBadge(tabId, container) {
+  // A native text badge has a fixed font and background size. Draw a small
+  // container-colored dot into the toolbar icon instead.
+  chrome.action.setBadgeText({ text: '', tabId });
+  updateToolbarIcon(tabId, container && !container.showTabColor ? container.color || '#7c7c7d' : null);
   if (container) {
-    // اگر showTabColor فعال باشد، Tab Group رنگی نشان می‌دهد
-    // پس badge (مربع کوچک) را خالی می‌کنیم تا دو تا نشانگر رنگی نداشته باشیم
-    if (container.showTabColor) {
-      chrome.action.setBadgeText({ text: '', tabId });
-    } else {
-      const emoji = ICON_MAP[container.icon] || '';
-      const badgeText = emoji.length > 0 ? emoji.charAt(0) : container.name.charAt(0).toUpperCase();
-      chrome.action.setBadgeText({ text: badgeText, tabId });
-      chrome.action.setBadgeBackgroundColor({ color: container.color || '#7c7c7d', tabId });
-    }
     chrome.action.setTitle({ title: container.name + ' Container', tabId });
   } else {
-    chrome.action.setBadgeText({ text: '', tabId });
     chrome.action.setTitle({ title: 'Multi Account Containers', tabId });
   }
 }
@@ -704,15 +755,16 @@ function updateBadge(tabId, container) {
 chrome.alarms.create('auto-save', { periodInMinutes: 2 });
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== 'auto-save') return;
+  await initialization;
   for (const [tidStr, cid] of Object.entries(tabMgr.getMap())) {
     try {
       const tabId = parseInt(tidStr);
       if (debuggerMgr.isAttached(tabId)) continue;
       const tab = await chrome.tabs.get(tabId);
       if (tab && tab.url && !tab.url.startsWith('chrome://') && tab.status === 'complete') {
-        await cookieMgr.saveContainerCookies(cid, tab.url);
+        await debuggerMgr.attach(tabId, cid);
       }
-    } catch { await tabMgr.remove(parseInt(tidStr)); }
+    } catch (e) { lastError = e.message; }
   }
 });
 
@@ -725,171 +777,90 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // ============================================================
 // CDP EVENT HANDLER — Cookie injection + Set-Cookie capture
 // ============================================================
+const responseHeaderQueues = new Map();
+function responseHeaderKey(tabId, requestId) { return tabId + ':' + requestId; }
+function receiveResponseHeaders(tabId, params) {
+  const key = responseHeaderKey(tabId, params.requestId);
+  const pending = responseHeaderQueues.get(key);
+  if (pending?.resolve) { responseHeaderQueues.delete(key); pending.resolve(params.headers); }
+  else {
+    const headers = pending || [];
+    headers.push(params.headers);
+    responseHeaderQueues.set(key, headers);
+  }
+}
+async function takeResponseHeaders(tabId, networkId) {
+  const key = responseHeaderKey(tabId, networkId);
+  const queued = responseHeaderQueues.get(key);
+  if (Array.isArray(queued) && queued.length) {
+    const headers = queued.shift();
+    if (!queued.length) responseHeaderQueues.delete(key);
+    return headers;
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      responseHeaderQueues.delete(key);
+      reject(new Error('Full response headers unavailable'));
+    }, 5000);
+    responseHeaderQueues.set(key, { resolve: headers => { clearTimeout(timer); resolve(headers); } });
+  });
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  const tabId = source.tabId;
-  if (!tabId) return;
-
-  // ============================================================
-  // Fetch.requestPaused — Cookie header injection
-  // ============================================================
-  // v4.4 FIX: headers را به فرمت استاندارد تبدیل می‌کنیم
-  // CDP ممکن است headers را به صورت Array یا Object بفرستد
-  // ============================================================
-  if (method === 'Fetch.requestPaused') {
-    const containerId = debuggerMgr.getContainerId(tabId) || tabMgr.getContainer(tabId);
-
-    if (!containerId) {
-      chrome.debugger.sendCommand({ tabId }, 'Fetch.continueRequest', {
-        requestId: params.requestId
-      }).catch(() => {});
-      return;
-    }
-
-    const cookieString = debuggerMgr.getCookieCache(tabId);
-
-    if (!cookieString) {
-      chrome.debugger.sendCommand({ tabId }, 'Fetch.continueRequest', {
-        requestId: params.requestId
-      }).catch(() => {});
-      return;
-    }
-
-    // ============================================================
-    // v4.4 CRITICAL FIX:
-    // CDP headers could be:
-    //   1. Array of objects: [{name: "Cookie", value: "..."}, ...]
-    //   2. Plain object: {"Cookie": "...", "Accept": "...", ...}
-    // We MUST handle both formats!
-    // ============================================================
-    const origHeaders = (params.request && params.request.headers) || [];
-    let headers;
-
-    if (Array.isArray(origHeaders)) {
-      // فرمت Array — shallow copy هر عنصر
-      headers = origHeaders.map(function(h) {
-        return { name: h.name, value: h.value };
+  if (method === 'Network.responseReceivedExtraInfo' && source.tabId) {
+    receiveResponseHeaders(source.tabId, params);
+    return;
+  }
+  if (method !== 'Fetch.requestPaused' || !source.tabId) return;
+  return handlePausedRequest(source.tabId, params).catch(async error => {
+    lastError = 'Isolation request failed: ' + error.message;
+    console.error('[Isolation]', error);
+    // Never retry with the browser's shared Cookie header.
+    try {
+      await chrome.debugger.sendCommand({ tabId: source.tabId }, 'Fetch.failRequest', {
+        requestId: params.requestId, errorReason: 'BlockedByClient'
       });
-    } else if (typeof origHeaders === 'object' && origHeaders !== null) {
-      // فرمت Object — تبدیل به Array
-      headers = [];
-      for (var key of Object.keys(origHeaders)) {
-        headers.push({ name: key, value: String(origHeaders[key]) });
-      }
-    } else {
-      // فرمت نامعتبر — بدون headers ادامه بده
-      chrome.debugger.sendCommand({ tabId }, 'Fetch.continueRequest', {
-        requestId: params.requestId
-      }).catch(() => {});
-      return;
-    }
+    } catch {}
+  });
+});
 
-    // Find and replace/add Cookie header
-    let cookieFound = false;
-    for (let i = 0; i < headers.length; i++) {
-      if (headers[i].name.toLowerCase() === 'cookie') {
-        headers[i].value = cookieString;
-        cookieFound = true;
-        break;
-      }
-    }
-    if (!cookieFound) {
-      headers.push({ name: 'Cookie', value: cookieString });
-    }
 
-    chrome.debugger.sendCommand({ tabId }, 'Fetch.continueRequest', {
-      requestId: params.requestId,
-      headers: headers
-    }).catch((e) => {
-      // اگر با headers شکست خورد، بدون headers دوباره تلاش کن
-      chrome.debugger.sendCommand({ tabId }, 'Fetch.continueRequest', {
-        requestId: params.requestId
-      }).catch(() => {});
+async function handlePausedRequest(tabId, params) {
+  await initialization;
+  const containerId = tabMgr.getContainer(tabId);
+  const target = { tabId };
+  if (!containerId) {
+    // An unassigned tab may still deliver a pending event during detach.
+    await chrome.debugger.sendCommand(target, 'Fetch.failRequest', {
+      requestId: params.requestId, errorReason: 'BlockedByClient'
     });
     return;
   }
-
-  // Fetch.authRequired
-  if (method === 'Fetch.authRequired') {
-    chrome.debugger.sendCommand({ tabId }, 'Fetch.continueWithAuth', {
-      requestId: params.requestId,
-      authChallengeResponse: { response: 'Default' }
-    }).catch(() => {});
-    return;
-  }
-
-  // Network.responseReceived — Set-Cookie capture
-  if (method === 'Network.responseReceived') {
-    const containerId = debuggerMgr.getContainerId(tabId) || tabMgr.getContainer(tabId);
-    if (!containerId) return;
-    const response = params.response;
-    if (!response || !response.url) return;
-    const setCookieHeaders = extractSetCookieHeaders(response.headers);
-    if (setCookieHeaders.length === 0) return;
-    handleCapturedCookies(tabId, containerId, response.url, setCookieHeaders);
-    return;
-  }
-
-  // Network.responseReceivedExtraInfo
-  if (method === 'Network.responseReceivedExtraInfo') {
-    const containerId = debuggerMgr.getContainerId(tabId) || tabMgr.getContainer(tabId);
-    if (!containerId) return;
-    const headers = params.headers;
-    if (!headers) return;
-    const setCookieHeaders = extractSetCookieHeaders(headers);
-    if (setCookieHeaders.length === 0) return;
-    handleCapturedCookies(tabId, containerId, '', setCookieHeaders);
-    return;
-  }
-});
-
-// ============================================================
-// HELPERS: Set-Cookie extraction & handling
-// ============================================================
-function extractSetCookieHeaders(headers) {
-  const result = [];
-  if (!headers) return result;
-  if (Array.isArray(headers)) {
-    for (const h of headers) {
-      if (h.name && h.name.toLowerCase() === 'set-cookie' && h.value) result.push(h.value);
+  if (params.responseStatusCode !== undefined) {
+    const headers = params.responseHeaders || [];
+    const complete = params.networkId ? await takeResponseHeaders(tabId, params.networkId) : null;
+    const cookies = complete
+      ? Object.entries(complete).filter(([name]) => name.toLowerCase() === 'set-cookie').map(([, value]) => value)
+      : headers.filter(h => h.name.toLowerCase() === 'set-cookie').map(h => h.value);
+    if (cookies.length) {
+      await cookieMgr.captureResponseSetCookie(containerId, params.request.url, cookies, !!complete);
+      await chrome.debugger.sendCommand(target, 'Fetch.continueResponse', {
+        requestId: params.requestId,
+        responseCode: params.responseStatusCode,
+        responseHeaders: headers.filter(h => h.name.toLowerCase() !== 'set-cookie')
+      });
+      await debuggerMgr.refreshContainer(containerId);
+    } else {
+      await chrome.debugger.sendCommand(target, 'Fetch.continueResponse', { requestId: params.requestId });
     }
-  } else if (typeof headers === 'object') {
-    for (const [name, value] of Object.entries(headers)) {
-      if (name.toLowerCase() === 'set-cookie' && value) result.push(value);
-    }
+    return;
   }
-  return result;
+  const original = params.request.headers || {};
+  const headers = (Array.isArray(original) ? original : Object.entries(original).map(([name, value]) => ({ name, value: String(value) })))
+    .filter(h => h.name.toLowerCase() !== 'cookie');
+  // An explicit empty Cookie header is intentional for a fresh container.
+  headers.push({ name: 'Cookie', value: await cookieMgr.getCookieString(containerId, params.request.url) });
+  await chrome.debugger.sendCommand(target, 'Fetch.continueRequest', { requestId: params.requestId, headers });
 }
 
-async function handleCapturedCookies(tabId, containerId, url, setCookieHeaders) {
-  try {
-    if (!url) {
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        url = tab ? tab.url : '';
-      } catch { return; }
-    }
-    if (!url) return;
-
-    const count = await cookieMgr.captureResponseSetCookie(containerId, url, setCookieHeaders);
-    if (count > 0) {
-      console.log('[v4.4] Captured', count, 'cookie(s) for container', containerId);
-      for (const raw of setCookieHeaders) {
-        const cookieStrings = raw.split(/,\s*(?=[a-zA-Z][\w-]*=)/);
-        for (const cs of cookieStrings) {
-          const parts = cs.split(';').map(s => s.trim());
-          if (parts.length === 0) continue;
-          const nv = parts[0].split('=');
-          const name = (nv[0] || '').trim();
-          const value = nv.slice(1).join('=').trim();
-          if (name && value) {
-            debuggerMgr.appendToCache(tabId, name, value);
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[v4.4] Error handling captured cookies:', e.message);
-  }
-}
-
-console.log('[Containers v4.4] Service Worker loaded — All bugs fixed!');
+console.log('[Containers] Service Worker loaded');

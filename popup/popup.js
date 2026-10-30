@@ -193,10 +193,6 @@ function renderContainerList() {
     h += '<span class="cl-dot" style="background:' + c.color + '"></span>';
     h += '<span class="cl-emoji">' + em(c.icon) + '</span>';
     h += '<span class="cl-name">' + esc(c.name) + '</span>';
-    // نمایش وضعیت Color tab bar
-    if (c.showTabColor) {
-      h += '<span class="cl-tabcolor"><span class="cl-tabcolor-dot" style="background:' + c.color + '"></span>ON</span>';
-    }
     h += '<div class="cl-actions"><button class="cl-edit" data-id="' + c.id + '">\u270F</button></div></div>';
   }
   el.innerHTML = h;
@@ -397,20 +393,17 @@ function bindAll() {
 }
 
 // ============================================================
-// MODAL — with showTabColor checkbox
+// MODAL
 // ============================================================
 function openModal(title, containerId) {
   document.getElementById('modal-title').textContent = title;
   document.getElementById('m-id').value = containerId || '';
   document.getElementById('m-name').value = '';
-  // checkbox state — default OFF
-  document.getElementById('m-show-tab-color').checked = false;
   if (isEdit && containerId) {
     var c = containers.find(function(x) { return x.id === containerId; });
     if (c) {
       document.getElementById('m-name').value = c.name;
       selColor = c.color; selIcon = c.icon;
-      document.getElementById('m-show-tab-color').checked = !!c.showTabColor;
     }
     document.getElementById('m-delete').style.display = 'inline-block';
     document.getElementById('m-ok').textContent = 'Save';
@@ -430,11 +423,10 @@ async function doModalSave() {
   var name = document.getElementById('m-name').value.trim();
   if (!name) return;
   var id = document.getElementById('m-id').value;
-  var showTabColor = document.getElementById('m-show-tab-color').checked;
   if (isEdit && id) {
-    await msg({ action: 'updateContainer', containerId: id, updates: { name: name, color: selColor, icon: selIcon, showTabColor: showTabColor } });
+    await msg({ action: 'updateContainer', containerId: id, updates: { name: name, color: selColor, icon: selIcon } });
   } else {
-    await msg({ action: 'createContainer', data: { name: name, color: selColor, icon: selIcon, showTabColor: showTabColor } });
+    await msg({ action: 'createContainer', data: { name: name, color: selColor, icon: selIcon } });
   }
   containers = (await msg({ action: 'getContainers' })) || [];
   renderCurrentBadge(); renderSubLists(); renderContainerList(); closeModal();

@@ -23,30 +23,9 @@
   // ============================================================
   // STEP 1: خواندن container ID از cookie
   // ============================================================
-  let containerId = '';
-  try {
-    const _origGetter = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') ||
-                        Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie');
-    if (_origGetter) {
-      const rawCookie = _origGetter.get.call(document);
-      const match = rawCookie.match(/__mc_container__=([^;]+)/);
-      if (match) containerId = decodeURIComponent(match[1]);
-    }
-  } catch (e) {
-    // Fallback: parse document.cookie directly
-    try {
-      const cookies = document.cookie.split(';');
-      for (let i = 0; i < cookies.length; i++) {
-        const parts = cookies[i].trim().split('=');
-        if (parts[0].trim() === '__mc_container__') {
-          containerId = decodeURIComponent(parts.slice(1).join('='));
-          break;
-        }
-      }
-    } catch (e2) {}
-  }
-
-  if (!containerId) return; // Not in a container
+  const containerId = globalThis.__mcContainerId;
+  if (!containerId || globalThis.__mcIsolationInstalled) return;
+  globalThis.__mcIsolationInstalled = true;
 
   const P = '__mc_' + containerId + '__';
 
@@ -97,6 +76,35 @@
     get: function() { return _ourKeys(this).length; },
     configurable: true
   });
+
+  // Storage also supports property access (storage.token), which bypasses getItem.
+  for (const property of ['localStorage', 'sessionStorage']) {
+    const storage = window[property];
+    const proxy = new Proxy(storage, {
+      get(target, key) {
+        if (typeof key !== 'string' || key in Storage.prototype) {
+          const value = Reflect.get(target, key, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+        const value = _origGetItem.call(target, P + key);
+        return value === null ? undefined : value;
+      },
+      set(target, key, value) { _origSetItem.call(target, P + String(key), String(value)); return true; },
+      deleteProperty(target, key) { _origRemoveItem.call(target, P + String(key)); return true; },
+      ownKeys(target) { return _ourKeys(target).map(key => key.substring(P.length)); },
+      has(target, key) { return key in Storage.prototype || _origGetItem.call(target, P + String(key)) !== null; },
+      getOwnPropertyDescriptor(target, key) {
+        const value = _origGetItem.call(target, P + String(key));
+        return value === null ? undefined : { value, writable: true, enumerable: true, configurable: true };
+      },
+      defineProperty(target, key, descriptor) {
+        if (!('value' in descriptor)) return false;
+        _origSetItem.call(target, P + String(key), String(descriptor.value));
+        return true;
+      },
+    });
+    Object.defineProperty(window, property, { get: () => proxy, configurable: true });
+  }
 
   // ============================================================
   // STEP 3: IndexedDB isolation (فوری!)
@@ -218,7 +226,11 @@
   // صفحه از طریق document.cookie هم کوکی‌ها را می‌خواند.
   // ما آن را بازنویسی می‌کنیم تا فقط کوکی‌های container را ببیند.
   // ============================================================
-  let _ourCookieString = '';
+  let _ourCookieString = (globalThis.__mcInitialCookies || [])
+    .filter(c => globalThis.__mcCookieMatchesUrl(c, location.href))
+    .map(c => c.name + '=' + c.value).join('; ');
+  delete globalThis.__mcInitialCookies;
+  delete globalThis.__mcCookieMatchesUrl;
 
   // Get the original property descriptor
   const _docCookieProto = Document.prototype;
@@ -229,7 +241,7 @@
 
   // Set our cookie string when received from background
   window.addEventListener('message', function(e) {
-    if (e.data && e.data.type === 'mc-cookie-response') {
+    if (e.source === window && e.data && e.data.type === 'mc-cookie-response' && e.data.containerId === containerId) {
       _ourCookieString = e.data.cookieString || '';
     }
   });
@@ -237,9 +249,7 @@
   if (_origDocCookieDesc) {
     Object.defineProperty(_docCookieProto, 'cookie', {
       get: function() {
-        // Return our container's cookies (if available), else original
-        if (_ourCookieString) return _ourCookieString;
-        return _origDocCookieDesc.get.call(this);
+        return _ourCookieString;
       },
       set: function(value) {
         // When WhatsApp sets a cookie, pass it to the bridge
@@ -248,8 +258,16 @@
             detail: { raw: value, containerId: containerId }
           }));
         }
-        // Also set in real storage (for compatibility)
-        try { _origDocCookieDesc.set.call(this, value); } catch (e) {}
+        // Keep synchronous reads local to this document; never write the shared jar.
+        const pair = String(value).split(';')[0];
+        const equals = pair.indexOf('=');
+        if (equals > 0) {
+          const name = pair.slice(0, equals).trim();
+          const parts = _ourCookieString ? _ourCookieString.split('; ').filter(p => p.split('=')[0] !== name) : [];
+          const deleted = /;\s*max-age\s*=\s*(?:0|-\d+)(?:;|$)/i.test(String(value));
+          if (!deleted) parts.push(pair.trim());
+          _ourCookieString = parts.join('; ');
+        }
         return value;
       },
       configurable: true
@@ -300,6 +318,44 @@
       }
     }, 100);
   };
+
+  // A new page must receive its container before its first request or script.
+  // Keep the native WindowProxy, but defer HTTP(S) navigation through the bridge.
+  const nativeOpen = window.open;
+  window.open = function(url, target, features) {
+    const name = target == null || target === '' ? '_blank' : String(target);
+    if (['_self', '_parent', '_top'].includes(name.toLowerCase()) || !url) {
+      return nativeOpen.apply(window, arguments);
+    }
+    let destination;
+    try { destination = new URL(String(url), document.baseURI); } catch { return nativeOpen.apply(window, arguments); }
+    if (!['http:', 'https:'].includes(destination.protocol)) return nativeOpen.apply(window, arguments);
+    // getRandomValues also works on HTTP intranet origins where randomUUID is absent.
+    const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('');
+    const marker = 'about:blank#mc-child-' + nonce;
+    const child = nativeOpen.call(window, marker, name, features);
+    // noopener/noreferrer deliberately returns null even when a tab is created.
+    if (child || /(?:^|,)\s*(?:noopener|noreferrer)(?:\s*=\s*(?:yes|1))?\s*(?:,|$)/i.test(features || '')) {
+      window.postMessage({ type: 'mc-open-child', marker, url: destination.href }, '*');
+    }
+    return child;
+  };
+
+  function inheritLink(event) {
+    if (event.defaultPrevented || event.altKey || (event.button !== 0 && event.button !== 1)) return;
+    const anchor = event.composedPath().find(node => node instanceof HTMLAnchorElement);
+    if (!anchor || anchor.hasAttribute('download')) return;
+    const target = anchor.target || document.querySelector('base[target]')?.target || '_self';
+    const modified = event.ctrlKey || event.metaKey || event.button === 1;
+    if (!modified && ['_self', '_parent', '_top'].includes(target.toLowerCase())) return;
+    if (!/^https?:/.test(anchor.href)) return;
+    event.preventDefault();
+    const features = anchor.relList.contains('noreferrer') ? 'noreferrer' :
+      (target.toLowerCase() === '_blank' || anchor.relList.contains('noopener') ? 'noopener' : '');
+    window.open(anchor.href, modified ? '_blank' : target, features);
+  }
+  window.addEventListener('click', inheritLink);
+  window.addEventListener('auxclick', inheritLink);
 
   console.log('[MC v4.1] FULLY ISOLATED for container:', containerId, '(SW blocked, storage isolated, no fetch intercept)');
 

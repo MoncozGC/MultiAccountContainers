@@ -17,7 +17,17 @@
   // ============================================================
   window.addEventListener('message', function(event) {
     // Only accept messages from our extension
-    if (!event.data || !event.data.type) return;
+    if (event.source !== window || !event.data || !event.data.type) return;
+
+    if (event.data.type === 'mc-open-child') {
+      chrome.runtime.sendMessage({
+        action: 'prepareChildTab', marker: event.data.marker, url: event.data.url
+      }, response => {
+        const error = chrome.runtime.lastError?.message || response?.error;
+        if (error) console.error('[Containers] Child tab could not start:', error);
+      });
+      return;
+    }
 
     // MAIN world wants cookie string for this container
     if (event.data.type === 'mc-get-cookies') {
@@ -32,7 +42,7 @@
         containerId: containerId,
         url: url
       }, function(response) {
-        if (response && !response.error && response.cookieString) {
+        if (response && !response.error && typeof response.cookieString === 'string') {
           // Send cookie string back to MAIN world
           window.postMessage({
             type: 'mc-cookie-response',

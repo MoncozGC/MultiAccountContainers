@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Manage Containers</title>
   <link rel="stylesheet" href="panel.css">
+  <link rel="stylesheet" href="../ui/theme.css">
+  <script src="../ui/theme.js"></script>
 </head>
 <body>
   <div id="app">
@@ -25,6 +27,14 @@
         </svg>
       </button>
     </header>
+    <div class="theme-bar">
+      <span>主题 / Theme</span>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换浅色" title="切换浅色">
+        <svg class="theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg>
+        <svg class="theme-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z"/></svg>
+        <span class="theme-toggle-label">切换浅色</span>
+      </button>
+    </div>
 
     <div id="tab-info" class="info-section" style="display:none">
       <div class="info-row"><span class="label">Current page:</span><span id="info-url" class="url-text"></span></div>
@@ -66,7 +76,7 @@
 
     <div class="tip-box">
       <strong>v4.4 Features:</strong><br>
-      - Opt-in colored tab bar per container<br>
+      - Automatic tab groups with container names and colors<br>
       - Debugger-based cookie isolation (CDP)<br>
       - Storage isolation (localStorage, IndexedDB, CacheStorage)<br>
       - Draggable badge on each page<br>
@@ -82,13 +92,8 @@
       <div class="field"><label>Name</label><input type="text" id="m-name" placeholder="e.g. WhatsApp 1" /></div>
       <div class="field"><label>Color</label><div id="m-colors" class="picker-row"></div></div>
       <div class="field"><label>Icon</label><div id="m-icons" class="picker-row"></div></div>
-      <div class="field field-checkbox">
-        <label class="checkbox-label">
-          <input type="checkbox" id="m-show-tab-color" />
-          <span class="checkbox-custom"></span>
-          <span>Color tab bar</span>
-        </label>
-        <span class="checkbox-hint">Shows a colored bar above the tab matching the container color</span>
+      <div class="field">
+        <span class="checkbox-hint">Tabs automatically share a group with this container's name and color.</span>
       </div>
       <div class="modal-btns">
         <button id="m-cancel" class="btn-secondary">Cancel</button>
